@@ -5,11 +5,19 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(glfw3 REQUIRED)
 find_package(OpenGL REQUIRED)
 
-include_directories(include)
+# Include both your standard include folder and the new imgui directory
+include_directories(include imgui)
 
+# Add all the core and backend ImGui files to the compilation list
 add_executable(app
     src/main.cpp
     src/glad.c
+    imgui/imgui.cpp
+    imgui/imgui_draw.cpp
+    imgui/imgui_widgets.cpp
+    imgui/imgui_tables.cpp
+    imgui/imgui_impl_glfw.cpp
+    imgui/imgui_impl_opengl3.cpp
 )
 
 # Pass the shader directory as an absolute path so the executable can find

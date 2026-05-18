@@ -5,13 +5,13 @@
 # compile CXX with /usr/bin/c++
 C_DEFINES = -DSHADER_DIR=\"/home/Epic/OpenGL-physics-engine/src/shaders/\"
 
-C_INCLUDES = -I/home/Epic/OpenGL-physics-engine/include
+C_INCLUDES = -I/home/Epic/OpenGL-physics-engine/include -I/home/Epic/OpenGL-physics-engine/imgui
 
 C_FLAGS = 
 
 CXX_DEFINES = -DSHADER_DIR=\"/home/Epic/OpenGL-physics-engine/src/shaders/\"
 
-CXX_INCLUDES = -I/home/Epic/OpenGL-physics-engine/include
+CXX_INCLUDES = -I/home/Epic/OpenGL-physics-engine/include -I/home/Epic/OpenGL-physics-engine/imgui
 
 CXX_FLAGS = -std=gnu++17
 

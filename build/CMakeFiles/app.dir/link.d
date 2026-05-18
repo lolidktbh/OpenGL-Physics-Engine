@@ -4,6 +4,12 @@ app: \
   /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/crtbeginS.o \
   CMakeFiles/app.dir/src/main.cpp.o \
   CMakeFiles/app.dir/src/glad.c.o \
+  CMakeFiles/app.dir/imgui/imgui.cpp.o \
+  CMakeFiles/app.dir/imgui/imgui_draw.cpp.o \
+  CMakeFiles/app.dir/imgui/imgui_widgets.cpp.o \
+  CMakeFiles/app.dir/imgui/imgui_tables.cpp.o \
+  CMakeFiles/app.dir/imgui/imgui_impl_glfw.cpp.o \
+  CMakeFiles/app.dir/imgui/imgui_impl_opengl3.cpp.o \
   /usr/lib/libglfw.so.3.4 \
   /usr/lib/libGL.so \
   /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libdl.a \
@@ -56,6 +62,18 @@ app: \
 CMakeFiles/app.dir/src/main.cpp.o:
 
 CMakeFiles/app.dir/src/glad.c.o:
+
+CMakeFiles/app.dir/imgui/imgui.cpp.o:
+
+CMakeFiles/app.dir/imgui/imgui_draw.cpp.o:
+
+CMakeFiles/app.dir/imgui/imgui_widgets.cpp.o:
+
+CMakeFiles/app.dir/imgui/imgui_tables.cpp.o:
+
+CMakeFiles/app.dir/imgui/imgui_impl_glfw.cpp.o:
+
+CMakeFiles/app.dir/imgui/imgui_impl_opengl3.cpp.o:
 
 /usr/lib/libglfw.so.3.4:
 

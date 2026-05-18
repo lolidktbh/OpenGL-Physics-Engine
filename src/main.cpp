@@ -6,30 +6,123 @@
 
 #include <iostream>
 #include <vector>
+#include <deque>
+#include <algorithm>
+#include <ctime>
 
 #include "shader.h"
 #include "mesh.h"
 #include "physics.h"
 #include "collision.h"
+#include "joints.h"
+
+// Include Dear ImGui headers from your subdirectory folder
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
 
 // =============================================================================
 // World constants
-//   WORLD_HEIGHT is fixed; WORLD_WIDTH is derived dynamically from the window
-//   aspect ratio so the projection always fills the viewport without distortion.
 // =============================================================================
-constexpr int   WINDOW_WIDTH  = 800;
-constexpr int   WINDOW_HEIGHT = 600;
+constexpr int   WINDOW_WIDTH  = 1024; // Widened slightly to fit sidebar menus comfortably
+constexpr int   WINDOW_HEIGHT = 768;
 constexpr float WORLD_HEIGHT  = 12.0f;
 
 // =============================================================================
 // Global simulation state
 // =============================================================================
-std::vector<RigidBody> sceneObjects;
+// ARCHITECTURE FIX: sceneObjects uses std::deque instead of std::vector.
+// std::vector invalidates ALL pointers/iterators on any push_back that causes
+// reallocation. Since bodyA/bodyB in joints, draggedBody, selectedInspectorBody,
+// and linkFirstSelection all store raw RigidBody* into this container, any
+// reallocation (from spawning or chain creation) silently turns every stored
+// pointer into a dangling pointer — causing the "malloc: invalid size (unsorted)"
+// heap corruption crash. std::deque guarantees pointer stability on push_back
+// with no reservation needed, solving this permanently for all call sites.
+std::deque<RigidBody>  sceneObjects;
 RigidBody              staticRamp;
-bool                   rampActive = false; // True once the player spawns a ramp with R
+bool                   rampActive = false;
+
+enum class LinkMode { NONE, SPRING, ROD };
+LinkMode currentLinkMode = LinkMode::NONE;
+RigidBody* linkFirstSelection = nullptr;
+
+std::vector<SpringJoint> globalSprings;
+std::vector<DistanceRod> globalRods;
+int selectedMaterialIndex = 0;
+
+// Global Environment Tweaks controlled by ImGui
+glm::vec3 globalGravity(0.0f, -9.81f, 0.0f);
+float     simulationTimeScale = 1.0f;
+
+// Spawner Settings Template (Tweak in UI before spawning)
+int   uiSelectedShapeType = 2; // Default: Circle
+float uiSpawnMass         = 5.0f;
+float uiSpawnSize         = 0.5f;
+float uiSpawnRestitution  = 0.6f;
+float uiSpawnFriction     = 0.3f;
+float uiSpawnDrag         = 0.05f;
+
+// Pointer to an item currently selected/clicked by user for inspector view
+RigidBody* selectedInspectorBody = nullptr;
 
 // =============================================================================
-// Vertex data (unit-space; the model matrix applies scale per object)
+// createChain
+// =============================================================================
+void createChain(glm::vec3 start, glm::vec3 end, int totalSegments, bool useSpring) {
+    if (totalSegments < 2) return;
+
+    glm::vec3 step = (end - start) / static_cast<float>(totalSegments);
+    RigidBody* previousBody = nullptr;
+
+    // Pointer stability is guaranteed by std::deque — no reserve() needed.
+    for (int i = 0; i <= totalSegments; ++i) {
+        RigidBody node;
+        // Make endpoints static anchors (infinite mass) if it's the start or end of a hanging bridge
+        bool isAnchor = (i == 0 || i == totalSegments);
+
+        //Define configure parameters for chain segments
+        glm::vec3 nodePos = start + step * static_cast<float>(i);
+        float nodeMass    = isAnchor ? 0.0f : 2.0f;
+        float nodeSize    = 0.25f;
+        float nodeDrag    = 0.05f;
+        float nodeRest    = 0.3f;
+        float nodeFrict   = 0.4f;
+        
+        //Arguments for physics.h
+        node.configure(ShapeType::Square, nodePos, nodeMass, nodeSize, nodeDrag, nodeRest, nodeFrict);
+        node.velocity = glm::vec3(0.0f);
+        node.angle = 0.0f;
+        node.angularVelocity = 0.0f;
+        node.gravity = globalGravity;
+
+        sceneObjects.push_back(node);
+        RigidBody* currentBody = &sceneObjects.back();
+
+        if (previousBody != nullptr) {
+            float dist = glm::distance(currentBody->position, previousBody->position);
+            if (useSpring) {
+                SpringJoint s;
+                s.bodyA = previousBody;
+                s.bodyB = currentBody;
+                s.restLength_L0 = dist;
+                s.materialIndex = selectedMaterialIndex;
+                globalSprings.push_back(s);
+            } else {
+                DistanceRod r;
+                r.bodyA = previousBody;
+                r.bodyB = currentBody;
+                r.targetLength = dist;
+                r.materialIndex = selectedMaterialIndex;
+                globalRods.push_back(r);
+            }
+        }
+        previousBody = currentBody;
+    }
+}
+
+// =============================================================================
+// Vertex data
 // =============================================================================
 float triangleVerts[] = {
     -0.5f, -0.5f, 0.0f,
@@ -37,7 +130,6 @@ float triangleVerts[] = {
      0.0f,  0.5f, 0.0f
 };
 
-// Two-triangle quad; used as the base mesh for squares AND circles
 float squareVerts[] = {
     -0.5f,  0.5f, 0.0f,   0.5f, -0.5f, 0.0f,  -0.5f, -0.5f, 0.0f,
     -0.5f,  0.5f, 0.0f,   0.5f,  0.5f, 0.0f,   0.5f, -0.5f, 0.0f
@@ -45,17 +137,14 @@ float squareVerts[] = {
 
 // =============================================================================
 // getMouseWorldPos
-//   Converts the raw GLFW cursor position (top-left origin, pixels) into the
-//   orthographic world space used by the physics simulation.
 // =============================================================================
 glm::vec3 getMouseWorldPos(GLFWwindow* window) {
     double mouseX, mouseY;
     glfwGetCursorPos(window, &mouseX, &mouseY);
 
-    int   winW, winH;
+    int winW, winH;
     glfwGetWindowSize(window, &winW, &winH);
 
-    // Match the dynamic projection: width scales with aspect ratio
     float aspect           = (float)winW / (float)winH;
     float dynamicWorldWidth = WORLD_HEIGHT * aspect;
 
@@ -67,137 +156,150 @@ glm::vec3 getMouseWorldPos(GLFWwindow* window) {
 
 // =============================================================================
 // isPointInsideBody
-//   Simple point-in-shape test used for click-to-drag picking.
-//   Circles use exact radial distance; everything else uses an AABB.
 // =============================================================================
 bool isPointInsideBody(const glm::vec3& point, const RigidBody& body) {
     if (body.type == ShapeType::Circle) {
         return glm::distance(point, body.position) <= body.radius;
     }
-    // AABB using halfHeight as the uniform half-extent for box/triangle
-    return (point.x >= body.position.x - body.halfHeight &&
-            point.x <= body.position.x + body.halfHeight &&
-            point.y >= body.position.y - body.halfHeight &&
-            point.y <= body.position.y + body.halfHeight);
+    float extent = body.halfHeight;
+    return (point.x >= body.position.x - extent &&
+            point.x <= body.position.x + extent &&
+            point.y >= body.position.y - extent &&
+            point.y <= body.position.y + extent);
 }
 
 // =============================================================================
-// keyCallback
-//   Spawns exactly one object per key-press event (GLFW_PRESS fires once).
-//   Spawn positions are randomised along a horizontal band near the top.
-// =============================================================================
-void keyCallback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/) {
-    if (action != GLFW_PRESS) return;
-
-    switch (key) {
-        case GLFW_KEY_ESCAPE:
-            glfwSetWindowShouldClose(window, true);
-            break;
-
-        case GLFW_KEY_T: {
-            RigidBody tri;
-            float rx = 4.0f + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / 8.0f));
-            // mass=0.5, halfHeight=0.5, drag=0.2, bounce=0.6, friction=0.2
-            tri.configure(ShapeType::Triangle, glm::vec3(rx, 10.0f, 0.0f), 0.5f, 0.5f, 0.2f, 0.6f, 0.2f);
-            sceneObjects.push_back(tri);
-            break;
-        }
-
-        case GLFW_KEY_B: {
-            RigidBody box;
-            float rx = 4.0f + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / 8.0f));
-            // mass=15, halfHeight=0.5, drag=0.05, bounce=0.4, friction=0.4
-            box.configure(ShapeType::Square, glm::vec3(rx, 10.0f, 0.0f), 15.0f, 0.5f, 0.05f, 0.4f, 0.4f);
-            sceneObjects.push_back(box);
-            break;
-        }
-
-        case GLFW_KEY_C: {
-            RigidBody circ;
-            float rx = 4.0f + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / 8.0f));
-            // mass=2.5, radius=0.5, drag=0.05, bounce=0.7, friction=0.5
-            circ.configure(ShapeType::Circle, glm::vec3(rx, 11.0f, 0.0f), 2.5f, 0.5f, 0.05f, 0.7f, 0.5f);
-            sceneObjects.push_back(circ);
-            break;
-        }
-
-        case GLFW_KEY_R:
-            // Configure ramp as an infinite-mass static segment (mass == 0 → invMass == 0)
-            staticRamp.configure(ShapeType::Ramp, glm::vec3(1.0f, 7.0f, 0.0f), 0.0f, 0.0f, 0.0f, 0.2f, 0.6f);
-            staticRamp.rampEnd = glm::vec3(13.0f, 2.0f, 0.0f);
-            rampActive         = true;
-            break;
-
-        default: break;
-    }
-}
-
-// =============================================================================
-// handleMouseDragging
-//   Left-click picks the top-most shape under the cursor; holding and moving
-//   the mouse drags it. Velocity is calculated from movement over time so that
-//   releasing the mouse "throws" the object.
+// handleMouseDragging & Right-Click Linker State Machine
 // =============================================================================
 void handleMouseDragging(GLFWwindow* window,
                          RigidBody*& draggedBody,
                          bool&       isDragging,
                          glm::vec3&  dragOffset,
-                         float       dt) // Track frame delta-time for velocity calculations
+                         float       dt) 
 {
-    glm::vec3 mouseWorld = getMouseWorldPos(window);
-    int       mouseState = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT);
+    // GUARD: If clicking on top of an ImGui window overlay, ignore physics interaction!
+    if (ImGui::GetIO().WantCaptureMouse) {
+        return;
+    }
 
-    if (mouseState == GLFW_PRESS) {
+    glm::vec3 mouseWorld = getMouseWorldPos(window);
+    int leftState  = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT);
+    int rightState = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT);
+
+    // --- Left Click Dragging Handler ---
+    if (leftState == GLFW_PRESS) {
         if (!isDragging) {
-            // Iterate back-to-front so topmost (last-drawn) shape wins
+            selectedInspectorBody = nullptr; // Reset inspection selection
             for (int i = (int)sceneObjects.size() - 1; i >= 0; --i) {
                 if (isPointInsideBody(mouseWorld, sceneObjects[i])) {
-                    isDragging  = true;
-                    draggedBody = &sceneObjects[i];
-                    dragOffset  = sceneObjects[i].position - mouseWorld;
+                    isDragging            = true;
+                    draggedBody           = &sceneObjects[i];
+                    selectedInspectorBody = &sceneObjects[i]; // Bind to inspector window
+                    dragOffset            = sceneObjects[i].position - mouseWorld;
                     break;
                 }
             }
         }
         if (isDragging && draggedBody) {
             glm::vec3 newPosition = mouseWorld + dragOffset;
-
-            // Calculate throwing velocity dynamically based on movement speed over time
             if (dt > 0.001f) {
                 draggedBody->velocity = (newPosition - draggedBody->position) / dt;
             }
-
             draggedBody->position        = newPosition;
-            draggedBody->angularVelocity = 0.0f; // Keep orientation stable during drag
+            draggedBody->angularVelocity = 0.0f;
         }
     } else {
-        // Button released — drop the body back into simulation (retains calculated throw momentum)
         isDragging  = false;
         draggedBody = nullptr;
+    }
+
+    // --- Right Click Connection Handler ---
+    static bool rightButtonLatch = false;
+    if (rightState == GLFW_PRESS) {
+        if (!rightButtonLatch) {
+            rightButtonLatch = true; // Simple push latch mechanism
+            
+            if (currentLinkMode != LinkMode::NONE) {
+                RigidBody* clickedTarget = nullptr;
+                for (int i = (int)sceneObjects.size() - 1; i >= 0; --i) {
+                    if (isPointInsideBody(mouseWorld, sceneObjects[i])) {
+                        clickedTarget = &sceneObjects[i];
+                        break;
+                    }
+                }
+
+                if (clickedTarget) {
+                    if (!linkFirstSelection) {
+                        linkFirstSelection = clickedTarget;
+                    } else if (linkFirstSelection != clickedTarget) {
+                        float currentDist = glm::distance(linkFirstSelection->position, clickedTarget->position);
+                        
+                        if (currentLinkMode == LinkMode::SPRING) {
+                            SpringJoint sj;
+                            sj.bodyA = linkFirstSelection;
+                            sj.bodyB = clickedTarget;
+                            sj.restLength_L0 = currentDist;
+                            sj.materialIndex = selectedMaterialIndex;
+                            globalSprings.push_back(sj);
+                        } else if (currentLinkMode == LinkMode::ROD) {
+                            DistanceRod dr;
+                            dr.bodyA = linkFirstSelection;
+                            dr.bodyB = clickedTarget;
+                            dr.targetLength = currentDist;
+                            dr.materialIndex = selectedMaterialIndex;
+                            globalRods.push_back(dr);
+                        }
+                        
+                        // BUG FIX: Only clear the first-selection latch, NOT the link mode.
+                        // Previously the tool deactivated after every single connection,
+                        // forcing the user to re-equip it each time. The mode now persists
+                        // so you can chain-link multiple objects without re-equipping.
+                        linkFirstSelection = nullptr;
+                        // currentLinkMode intentionally left active
+                    }
+                }
+            }
+        }
+    } else {
+        rightButtonLatch = false;
     }
 }
 
 // =============================================================================
-// framebuffer_size_callback
-//   Keeps the OpenGL viewport in sync with the OS window size.
+// Helper Spawner Logic
 // =============================================================================
+void spawnObjectFromTemplate(ShapeType type, float mass, float size, float rest, float frict, float drag) {
+    RigidBody body;
+    float rx = 3.0f + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / 6.0f));
+    
+    body.configure(type, glm::vec3(rx, 10.5f, 0.0f), mass, size, drag, rest, frict);
+    body.gravity = globalGravity; // Set base gravity vector
+    sceneObjects.push_back(body);
+}
+
+void keyCallback(GLFWwindow* window, int key, int, int action, int) {
+    if (action != GLFW_PRESS) return;
+
+    if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, true);
+    if (key == GLFW_KEY_T)      spawnObjectFromTemplate(ShapeType::Triangle, 1.0f, 0.5f, 0.5f, 0.2f, 0.05f);
+    if (key == GLFW_KEY_B)      spawnObjectFromTemplate(ShapeType::Square, 10.0f, 0.5f, 0.3f, 0.4f, 0.05f);
+    if (key == GLFW_KEY_C)      spawnObjectFromTemplate(ShapeType::Circle, 2.5f, 0.5f, 0.7f, 0.4f, 0.02f);
+    if (key == GLFW_KEY_R) {
+        staticRamp.configure(ShapeType::Ramp, glm::vec3(1.0f, 6.0f, 0.0f), 0.0f, 0.0f, 0.0f, 0.2f, 0.5f);
+        staticRamp.rampEnd = glm::vec3(13.0f, 2.5f, 0.0f);
+        rampActive         = true;
+    }
+}
+
 void framebuffer_size_callback(GLFWwindow*, int width, int height) {
     glViewport(0, 0, width, height);
 }
 
-// =============================================================================
-// buildTransform
-//   Constructs the model matrix for a body: translate → rotate → scale.
-// =============================================================================
 glm::mat4 buildTransform(const RigidBody& body) {
     glm::mat4 m = glm::translate(glm::mat4(1.0f), body.position);
     m           = glm::rotate(m, body.angle, glm::vec3(0.0f, 0.0f, 1.0f));
-
-    float s = (body.type == ShapeType::Circle)
-              ? body.radius * 2.0f         // Diameter so the unit quad spans the full circle
-              : body.halfHeight * 2.0f;    // Full side length for triangles and boxes
-
-    m = glm::scale(m, glm::vec3(s, s, 1.0f));
+    float s     = (body.type == ShapeType::Circle) ? body.radius * 2.0f : body.halfHeight * 2.0f;
+    m           = glm::scale(m, glm::vec3(s, s, 1.0f));
     return m;
 }
 
@@ -207,20 +309,27 @@ glm::mat4 buildTransform(const RigidBody& body) {
 int main() {
     srand(static_cast<unsigned int>(time(nullptr)));
 
-    // ---- Window + context setup ----
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT,
-                                          "OpenGL Physics Engine", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "OpenGL Material Engineering Sandbox", nullptr, nullptr);
     if (!window) { glfwTerminate(); return -1; }
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetKeyCallback(window, keyCallback);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) return -1;
+
+    // ---- Setup Dear ImGui context ----
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
 
     // ---- Shaders & meshes ----
     Shader standardShader("shader.vert", "shader.frag");
@@ -233,75 +342,241 @@ int main() {
     bool       isDragging  = false;
     glm::vec3  dragOffset(0.0f);
 
-    // ---- Fixed timestep accumulator ----
     constexpr float FIXED_DT  = 1.0f / 60.0f;
     float           lastFrame = 0.0f;
     float           accumulator = 0.0f;
+    glm::mat4       projection(1.0f);
 
-    // ---- Projection (rebuilt each frame to handle window resize) ----
-    glm::mat4 projection(1.0f);
-
-    // ==========================================================================
-    // Main loop
-    // ==========================================================================
     while (!glfwWindowShouldClose(window)) {
-
-        // ---- Frame timing ----
         float currentFrame = (float)glfwGetTime();
-        float frameTime    = glm::min(currentFrame - lastFrame, 0.25f); // clamp spiral of death
+        float frameTime    = glm::min(currentFrame - lastFrame, 0.25f);
         lastFrame          = currentFrame;
-        accumulator       += frameTime;
 
-        // ---- Dynamic world width (recalculated once per frame for resize support) ----
-        int   winW, winH;
+        accumulator += frameTime * simulationTimeScale;
+
+        int winW, winH;
         glfwGetWindowSize(window, &winW, &winH);
         float aspect           = (float)winW / (float)winH;
         float dynamicWorldWidth = WORLD_HEIGHT * aspect;
 
-        // Rebuild projection to match current aspect ratio
         projection = glm::ortho(0.0f, dynamicWorldWidth, 0.0f, WORLD_HEIGHT, -1.0f, 1.0f);
 
-        // ---- Input ----
+        // ---- Start ImGui Frame Context ----
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
         handleMouseDragging(window, draggedBody, isDragging, dragOffset, frameTime);
 
-        // ---- Fixed-step physics ----
+        // =====================================================================
+        // ImGui Windows Layout Definitions
+        // =====================================================================
+        {
+            // --- PANEL 1: Global Settings ---
+            ImGui::Begin("Global Physics Control Panel");
+            ImGui::Text("Simulation Statistics:");
+            ImGui::Text("Loop speed: %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+            ImGui::Text("Objects: %d | Springs: %d | Rods: %d", (int)sceneObjects.size(), (int)globalSprings.size(), (int)globalRods.size());
+            
+            ImGui::Separator();
+            ImGui::Text("Environment Constants:");
+            if (ImGui::SliderFloat2("World Gravity Vector", &globalGravity.x, -20.0f, 20.0f)) {
+                for (auto& obj : sceneObjects) obj.gravity = globalGravity;
+            }
+            ImGui::SliderFloat("Simulation Speed (TimeScale)", &simulationTimeScale, 0.0f, 2.0f, "%.2fx");
+
+            ImGui::Separator();
+            if (ImGui::Button("Clear All System Entities", ImVec2(-1, 25))) {
+                sceneObjects.clear();
+                globalSprings.clear();
+                globalRods.clear();
+                selectedInspectorBody = nullptr;
+                linkFirstSelection = nullptr;
+            }
+            if (ImGui::Button("Toggle Ground Ramp Line", ImVec2(-1, 25))) {
+                if (!rampActive) {
+                    staticRamp.configure(ShapeType::Ramp, glm::vec3(1.0f, 5.5f, 0.0f), 0.0f, 0.0f, 0.0f, 0.2f, 0.5f);
+                    staticRamp.rampEnd = glm::vec3(dynamicWorldWidth - 1.0f, 2.0f, 0.0f);
+                    rampActive = true;
+                } else {
+                    rampActive = false;
+                }
+            }
+            ImGui::End();
+
+            // --- PANEL 2: Interactive Spawner Settings ---
+            ImGui::Begin("Shape Spawner Menu");
+            const char* shapesList[] = { "Triangle", "Square", "Circle" };
+            ImGui::Combo("Spawn Geometry Model", &uiSelectedShapeType, shapesList, IM_ARRAYSIZE(shapesList));
+            
+            ImGui::SliderFloat("Mass Setting", &uiSpawnMass, 0.1f, 100.0f, "%.1f kg");
+            ImGui::SliderFloat("Extent Bounds / Size", &uiSpawnSize, 0.1f, 2.0f, "%.2f units");
+            ImGui::SliderFloat("Restitution (Bounciness)", &uiSpawnRestitution, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Surface Friction Coefficient", &uiSpawnFriction, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Linear Air Drag Resistance", &uiSpawnDrag, 0.0f, 0.5f, "%.3f");
+
+            if (ImGui::Button("Drop Shape Into Scene Box", ImVec2(-1, 30))) {
+                spawnObjectFromTemplate(static_cast<ShapeType>(uiSelectedShapeType), 
+                                        uiSpawnMass, uiSpawnSize, uiSpawnRestitution, 
+                                        uiSpawnFriction, uiSpawnDrag);
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Engineering Structural Connections:");
+            
+            if (ImGui::BeginCombo("Material Preset", MATERIAL_DATABASE[selectedMaterialIndex].name.c_str())) {
+                for (int i = 0; i < (int)MATERIAL_DATABASE.size(); i++) {
+                    bool isSelected = (selectedMaterialIndex == i);
+                    if (ImGui::Selectable(MATERIAL_DATABASE[i].name.c_str(), isSelected)) {
+                        selectedMaterialIndex = i;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            if (currentLinkMode == LinkMode::SPRING) {
+                ImGui::TextColored(ImVec4(0,1,0,1), "Tool: Right-Click 2 objects to bind via Spring.");
+            } else if (currentLinkMode == LinkMode::ROD) {
+                ImGui::TextColored(ImVec4(0,0,1,1), "Tool: Right-Click 2 objects to bind via Rigid Rod.");
+            } else {
+                ImGui::Text("Linker Status: Inactive");
+            }
+
+            if (ImGui::Button("Equip Spring Linker")) { currentLinkMode = LinkMode::SPRING; linkFirstSelection = nullptr; }
+            ImGui::SameLine();
+            if (ImGui::Button("Equip Rod Linker")) { currentLinkMode = LinkMode::ROD; linkFirstSelection = nullptr; }
+
+            ImGui::Separator();
+            static int chainSegments = 8;
+            static bool chainTypeSpring = true;
+            ImGui::SliderInt("Chain Links", &chainSegments, 2, 25);
+            ImGui::Checkbox("Use Elastic Spring Links", &chainTypeSpring);
+            if (ImGui::Button("Spawn Structural Chain Bridge", ImVec2(-1, 25))) {
+                createChain(glm::vec3(2.0f, 9.5f, 0.0f), glm::vec3(dynamicWorldWidth - 2.0f, 9.5f, 0.0f), chainSegments, chainTypeSpring);
+            }
+            ImGui::End();
+
+            // --- PANEL 3: Live Selected Object Properties Inspector ---
+            ImGui::Begin("Active Properties Inspector");
+            if (selectedInspectorBody == nullptr) {
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Click/drag an object to inspect it.");
+            } else {
+                ImGui::Text("Inspecting Shape: %s", 
+                            (selectedInspectorBody->type == ShapeType::Circle) ? "Circle" : 
+                            (selectedInspectorBody->type == ShapeType::Square) ? "Square" : "Triangle");
+                
+                ImGui::Separator();
+                ImGui::Text("Position: X:%.2f, Y:%.2f", selectedInspectorBody->position.x, selectedInspectorBody->position.y);
+                ImGui::Text("Velocity: X:%.2f, Y:%.2f", selectedInspectorBody->velocity.x, selectedInspectorBody->velocity.y);
+                ImGui::Text("Angular Speed: %.2f rad/s", selectedInspectorBody->angularVelocity);
+
+                ImGui::Separator();
+                if (ImGui::SliderFloat("Object Mass", &selectedInspectorBody->mass, 0.1f, 100.0f, "%.1f")) {
+                    selectedInspectorBody->invMass = (selectedInspectorBody->mass > 0.0f) ? 1.0f / selectedInspectorBody->mass : 0.0f;
+                    float size = selectedInspectorBody->halfHeight * 2.0f;
+                    if (selectedInspectorBody->type == ShapeType::Circle) {
+                        selectedInspectorBody->inertia = 0.5f * selectedInspectorBody->mass * (selectedInspectorBody->radius * selectedInspectorBody->radius);
+                    } else {
+                        selectedInspectorBody->inertia = (1.0f / 12.0f) * selectedInspectorBody->mass * (size * size + size * size);
+                    }
+                    selectedInspectorBody->invInertia = (selectedInspectorBody->inertia > 0.0f) ? 1.0f / selectedInspectorBody->inertia : 0.0f;
+                }
+                ImGui::SliderFloat("Restitution", &selectedInspectorBody->restitution, 0.0f, 1.0f);
+                ImGui::SliderFloat("Friction",    &selectedInspectorBody->friction,    0.0f, 1.0f);
+                ImGui::SliderFloat("Air Drag",    &selectedInspectorBody->dragCoefficient, 0.0f, 0.5f);
+            }
+            ImGui::End();
+        }
+
+        // ---- Fixed-step physics pipeline ----
+        //
+        // Architecture (matches Box2D / Bullet approach):
+        //
+        //  Per tick:
+        //   1. Sub-step springs  (SPRING_SUBSTEPS mini-steps of FIXED_DT/N)
+        //      Sub-stepping lets the spring ODE stay stable with physically
+        //      correct stiffness values from the Wahl formula — no fudge factors.
+        //   2. Integrate bodies  (one full FIXED_DT step)
+        //   3. Iterate rod velocity constraints  (VELOCITY_ITERATIONS passes)
+        //      Multiple passes let impulses propagate through chains (convergence).
+        //   4. Resolve collisions
+        //   5. Rod position projection  (one pass, zero energy injection)
+        //      Corrects positional drift without Baumgarte's energy bias or its
+        //      frame-1 impulse spike that was shattering chains on spawn.
+        //   6. Spring breaking check  (once per tick, after all sub-steps)
+        //   7. Prune broken joints
+
+        constexpr int   SPRING_SUBSTEPS      = 8;   // sub-steps per tick for springs
+        constexpr int   VELOCITY_ITERATIONS  = 10;  // sequential impulse iterations for rods
+        constexpr float SUB_DT               = FIXED_DT / static_cast<float>(SPRING_SUBSTEPS);
+
         while (accumulator >= FIXED_DT) {
 
-            // Integrate all non-dragged bodies
+            // 1. Spring sub-steps — stable integration of stiff spring ODEs
+            for (int sub = 0; sub < SPRING_SUBSTEPS; ++sub) {
+                for (auto& spring : globalSprings) {
+                    spring.updateAndApplyForces(SUB_DT);
+                }
+            }
+
+            // 2. Integrate bodies
             for (auto& obj : sceneObjects) {
                 if (&obj == draggedBody) continue;
                 obj.update(FIXED_DT);
             }
 
-            // Collision resolution
-            for (size_t i = 0; i < sceneObjects.size(); ++i) {
-                // Ramp collisions (circles only, guarded inside the function)
-                if (rampActive)
-                    resolveCircleVsRamp(sceneObjects[i], staticRamp);
-
-                // World boundary clamp
-                resolveWorldBoundaries(sceneObjects[i], 0.0f, dynamicWorldWidth, 0.0f, WORLD_HEIGHT);
-
-                // Object-to-object collisions (upper triangle of the pair matrix)
-                for (size_t j = i + 1; j < sceneObjects.size(); ++j)
-                    resolveObjectCollisions(sceneObjects[i], sceneObjects[j]);
+            // 3. Rod velocity constraint iterations (sequential impulses)
+            for (int iter = 0; iter < VELOCITY_ITERATIONS; ++iter) {
+                for (auto& rod : globalRods) {
+                    rod.resolveVelocity(FIXED_DT);
+                }
             }
+
+            // 4. Collision resolution
+            for (size_t i = 0; i < sceneObjects.size(); ++i) {
+                if (rampActive) resolveCircleVsRamp(sceneObjects[i], staticRamp);
+                resolveWorldBoundaries(sceneObjects[i], 0.0f, dynamicWorldWidth, 0.0f, WORLD_HEIGHT);
+                for (size_t j = i + 1; j < sceneObjects.size(); ++j) {
+                    resolveObjectCollisions(sceneObjects[i], sceneObjects[j]);
+                }
+            }
+
+            // 5. Rod position projection (drift correction, no energy added)
+            for (auto& rod : globalRods) {
+                rod.resolvePosition();
+            }
+
+            // 6. Spring breaking check — evaluated on strain after all sub-steps
+            for (auto& spring : globalSprings) {
+                spring.checkBreaking();
+            }
+
+            // 7. Prune broken joints
+            globalSprings.erase(
+                std::remove_if(globalSprings.begin(), globalSprings.end(),
+                    [](const SpringJoint& s) { return s.isBroken; }),
+                globalSprings.end()
+            );
+            globalRods.erase(
+                std::remove_if(globalRods.begin(), globalRods.end(),
+                    [](const DistanceRod& r) { return r.isBroken; }),
+                globalRods.end()
+            );
 
             accumulator -= FIXED_DT;
         }
 
-        // ---- Render ----
+        // ---- Render Output Framework ----
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        // -- Static ramp --
+        // Render Ramp
         if (rampActive) {
-            glm::vec3 dir      = staticRamp.rampEnd - staticRamp.position;
+            glm::vec3 dir       = staticRamp.rampEnd - staticRamp.position;
             float     rampAngle = atan2(dir.y, dir.x);
 
             glm::mat4 rampTransform = glm::translate(glm::mat4(1.0f), staticRamp.position);
             rampTransform           = glm::rotate(rampTransform, rampAngle, glm::vec3(0.0f, 0.0f, 1.0f));
-            // Scale X to ramp length, Y to a thin visible strip
             rampTransform           = glm::scale(rampTransform, glm::vec3(glm::length(dir), 0.1f, 1.0f));
 
             standardShader.use();
@@ -310,7 +585,7 @@ int main() {
             squareMesh.draw();
         }
 
-        // -- Dynamic bodies --
+        // Render Sim Objects
         for (const auto& obj : sceneObjects) {
             glm::mat4 transform = buildTransform(obj);
 
@@ -318,9 +593,8 @@ int main() {
                 circleShader.use();
                 circleShader.setMat4("projection", projection);
                 circleShader.setMat4("transform",  transform);
-                squareMesh.draw(); // Circle SDF is applied in circle.frag
+                squareMesh.draw();
             } else {
-                // Triangle and Square share the standard (flat colour) shader
                 standardShader.use();
                 standardShader.setMat4("projection", projection);
                 standardShader.setMat4("transform",  transform);
@@ -332,9 +606,44 @@ int main() {
             }
         }
 
+        // Render Joint Links via Direct Pipeline Line Drawing
+        glUseProgram(0); // Unbind programmable core shaders to use standard pipeline matrices
+        glMatrixMode(GL_PROJECTION);
+        glLoadMatrixf(glm::value_ptr(projection));
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+
+        glLineWidth(3.0f);
+        glBegin(GL_LINES);
+        // Draw Dynamic Springs (Green -> Red gradient shift depending on strain stress)
+        for (const auto& spring : globalSprings) {
+            float breakingLimit = MATERIAL_DATABASE[spring.materialIndex].breakingStrain;
+            float strainFactor = std::min(std::abs(spring.currentStrain) / breakingLimit, 1.0f);
+            glColor3f(strainFactor, 1.0f - strainFactor, 0.0f);
+            glVertex2f(spring.bodyA->position.x, spring.bodyA->position.y);
+            glVertex2f(spring.bodyB->position.x, spring.bodyB->position.y);
+        }
+        // Draw Rigid Distance Rods (Blue color layout)
+        glColor3f(0.2f, 0.6f, 1.0f);
+        for (const auto& rod : globalRods) {
+            glVertex2f(rod.bodyA->position.x, rod.bodyA->position.y);
+            glVertex2f(rod.bodyB->position.x, rod.bodyB->position.y);
+        }
+        glEnd();
+        glColor3f(1.0f, 1.0f, 1.0f); // Reset color map profile
+
+        // ---- Finalize and render the ImGui application drawer layout ----
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
+
+    // ---- Cleanup Allocations ----
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
 
     glfwTerminate();
     return 0;
