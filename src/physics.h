@@ -44,6 +44,10 @@ struct RigidBody {
     float     halfHeight;   // Used when type == Triangle or Square
     glm::vec3 rampEnd;      // Second endpoint of the segment when type == Ramp
 
+    // ---- Freeze State ----
+    bool  isFrozen = false;
+    float originalMass = 1.0f; // Remembers mass configuration while frozen
+
     // ---- Constructor: safe zero/default state ----
     RigidBody()
         : type(ShapeType::Triangle),
@@ -51,7 +55,8 @@ struct RigidBody {
           angle(0.0f), angularVelocity(0.0f), torque(0.0f),
           mass(0.0f), invMass(0.0f), inertia(0.0f), invInertia(0.0f),
           dragCoefficient(0.15f), restitution(0.7f), friction(0.3f),
-          radius(0.0f), halfHeight(0.5f), rampEnd(0.0f) {}
+          radius(0.0f), halfHeight(0.5f), rampEnd(0.0f),
+          isFrozen(false), originalMass(1.0f) {}
 
     // -------------------------------------------------------------------------
     // configure()
@@ -101,6 +106,32 @@ struct RigidBody {
         }
 
         invInertia = (inertia > 0.0f) ? 1.0f / inertia : 0.0f;
+    }
+
+    // -------------------------------------------------------------------------
+    // Freeze / Unfreeze System
+    // -------------------------------------------------------------------------
+    void freeze() {
+        if (isFrozen) return;
+        isFrozen = true;
+        originalMass = mass; // Stash the current simulated weight
+        
+        mass       = 0.0f;
+        invMass    = 0.0f;
+        invInertia = 0.0f;
+        
+        velocity        = glm::vec3(0.0f);
+        angularVelocity = 0.0f;
+        torque          = 0.0f;
+    }
+
+    void unfreeze() {
+        if (!isFrozen) return;
+        isFrozen = false;
+        
+        // Recalculate tensor configurations safely using the original mass properties
+        configure(type, position, originalMass, (type == ShapeType::Circle ? radius : halfHeight), 
+                  dragCoefficient, restitution, friction);
     }
 
     // -------------------------------------------------------------------------

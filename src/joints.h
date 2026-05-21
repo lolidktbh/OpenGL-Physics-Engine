@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <algorithm>
 #include "physics.h"
 
 // =============================================================================
@@ -50,8 +51,8 @@ const std::vector<MaterialPreset> MATERIAL_DATABASE = {
 // =============================================================================
 // Physics method:
 //   - Stiffness from Wahl coil-spring formula: k = (G*d^4)/(8*D^3*Na)
-//   - Each sub-step applies spring force*sub_dt as a velocity impulse (semi-
-//     implicit Euler), plus a damping velocity impulse (no extra dt factor).
+//   - Each sub-step applies pure forces integrated via sub_dt (J = F * sub_dt).
+//     Damping force scales correctly, avoiding numeric overshoots.
 //   - Breaking evaluated once per full tick on strain, not per-sub-step, so
 //     fast transients don't cause premature snapping due to numerical overshoot.
 //   - Plastic permanent set: rest length creeps when strain exceeds yield limit.
@@ -64,8 +65,8 @@ struct SpringJoint {
     glm::vec3 localAnchorB{0.0f};
 
     int   materialIndex  = 0;
-    float wireDiameter_d = 0.15f;   // m
-    float coilDiameter_D = 1.20f;   // m
+    float wireDiameter_d = 0.005f;  // m  (5 mm wire — reasonable for game-scale objects; If the wire is too large the springs become unstable!)
+    float coilDiameter_D = 0.05f;   // m  (50 mm coil diameter; Same deal here... )
     float activeCoils_Na = 10.0f;
 
     float restLength_L0  = 1.0f;
@@ -79,13 +80,15 @@ struct SpringJoint {
     float computeStiffness() const {
         // Wahl formula: k = (G * d^4) / (8 * D^3 * Na)
         // G in GPa, d/D in metres → k in GPa·m (= 1e9 N/m).
-        // Our scene is metre-scale so we want N/m, not GN/m.
-        // Divide by 1e9 to convert GPa → Pa·m unit chain → N/m.
-        // (Equivalently: store G in Pa, compute normally.)
         float G  = MATERIAL_DATABASE[materialIndex].shearModulusG * 1e9f; // Pa
         float d4 = std::pow(wireDiameter_d, 4.0f);
         float D3 = std::pow(coilDiameter_D, 3.0f);
-        return std::max((G * d4) / (8.0f * D3 * activeCoils_Na), 0.01f);
+        float rawK = (G * d4) / (8.0f * D3 * activeCoils_Na);
+        
+        // Clamp to a safe structural maximum for standard 60Hz / 8-substep stability.
+        // At ~2kg node mass and sub_dt=1/480s the critical k is ~450,000 N/m, but
+        // keeping well below that (5000) avoids explosion at lighter masses too.
+        return std::clamp(rawK, 0.01f, 5000.0f);
     }
 
     // One sub-step. sub_dt = FIXED_DT / SPRING_SUBSTEPS.
@@ -94,7 +97,7 @@ struct SpringJoint {
 
         calculatedK = computeStiffness();
 
-        // w=0: rotating an offset vector, not transforming a point
+        // w=0.0f: correctly transforms local anchor offsets without translation bleeding
         glm::mat4 rotA = glm::rotate(glm::mat4(1.0f), bodyA->angle, glm::vec3(0,0,1));
         glm::mat4 rotB = glm::rotate(glm::mat4(1.0f), bodyB->angle, glm::vec3(0,0,1));
         glm::vec3 wA   = bodyA->position + glm::vec3(rotA * glm::vec4(localAnchorA, 0.0f));
@@ -118,20 +121,24 @@ struct SpringJoint {
             }
         }
 
-        // Spring impulse (semi-implicit: force*sub_dt)
-        float springImpulse = (L - restLength_L0) * calculatedK * sub_dt;
+        // Calculate pure structural forces (SI Units: Newtons)
+        float springForceScalar = (L - restLength_L0) * calculatedK;
 
-        // Damping impulse (velocity-level, no extra dt)
+        // Correct velocity-level relative updates using structural leverage offsets
         glm::vec3 rA   = wA - bodyA->position;
         glm::vec3 rB   = wB - bodyB->position;
         glm::vec3 velA = bodyA->velocity + glm::vec3(-bodyA->angularVelocity * rA.y,
                                                       bodyA->angularVelocity * rA.x, 0.0f);
         glm::vec3 velB = bodyB->velocity + glm::vec3(-bodyB->angularVelocity * rB.y,
                                                       bodyB->angularVelocity * rB.x, 0.0f);
-        float relVel      = glm::dot(velB - velA, n);
-        float dampImpulse = -relVel * damping;
+        float relVel = glm::dot(velB - velA, n);
+        
+        // F_damp = -c * v  (opposes relative velocity — negative sign is correct)
+        float dampingForceScalar = -relVel * damping;
 
-        glm::vec3 J = n * (springImpulse + dampImpulse);
+        // Combine into a pure force vector, then integrate into an impulse window
+        glm::vec3 totalForce = n * (springForceScalar + dampingForceScalar);
+        glm::vec3 J = totalForce * sub_dt;
 
         if (bodyA->invMass    > 0.0f) bodyA->velocity        += J * bodyA->invMass;
         if (bodyB->invMass    > 0.0f) bodyB->velocity        -= J * bodyB->invMass;
